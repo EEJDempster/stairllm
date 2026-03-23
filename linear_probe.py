@@ -67,7 +67,7 @@ print("before filter:", len(DATASET["train"]))
 # print("sample:", DATASET["train"][0])
 
 def to_text(x):
-    v = x.get("ideal_completions_data", "")
+    v = x.get("prompt", "")
     if isinstance(v, str):
         return v
     if isinstance(v, list):
@@ -105,7 +105,7 @@ def extract_activations(model: AutoModel, tokenizer: AutoTokenizer, layer_num: i
         with torch.no_grad():
             outputs = model(**inputs, output_hidden_states=True)
 
-        embeddings = outputs.hidden_states[layer_num]
+        embeddings = outputs.hidden_states[layer_num].cpu()
         logging.debug(f'Extracted hidden states of shape {embeddings.shape}')
 
         if i== 0:
@@ -125,9 +125,10 @@ class Probe():
             torch.nn.Linear(hidden_dim, class_size),
             torch.nn.Sigmoid()
         )
+        self.probe = self.probe.to(device)
     
     def train(self, data_embeddings: torch.Tensor, labels: torch.Tensor, num_epoch: int = 3,
-              learning_rate: float = 0.001, batch_size : int = 32) -> None:
+        learning_rate: float = 0.001, batch_size : int = 32) -> None:
         criterion = torch.nn.CrossEntropyLoss()
 
         optimizer = torch.optim.Adam(self.probe.parameters(), lr=learning_rate)
@@ -135,10 +136,10 @@ class Probe():
         logging.info("training the probe...")
         for epoch in range(num_epoch):
             for i in range(0, len(data_embeddings), batch_size):
-                batch_embeddings = data_embeddings[i:i+batch_size].detatch()
-                batch_labels = labels[i:i+batch_size]
+                batch_embeddings = data_embeddings[i:i+batch_size].detach()
+                batch_labels = labels[i:i+batch_size].to_device()
 
-                batch_embeddings = torch.mean(batch_embeddings, dim=1)
+                batch_embeddings = torch.mean(batch_embeddings, dim=1).to(device)
 
                 outputs = self.probe(batch_embeddings)
 
@@ -153,7 +154,7 @@ class Probe():
         for i in range(0, len(data_embeddings), batch_size):
             batch_embeddings = data_embeddings[i:i+batch_size]
 
-            batch_embeddings = torch.mean(batch_embeddings, dim=1)
+            batch_embeddings = torch.mean(batch_embeddings, dim=1).to(device)
 
             outputs = self.probe(batch_embeddings)
 
@@ -167,13 +168,13 @@ class Probe():
 
         return all_predicted
     
-    def evaluate(self, data_embeddings: torch.tensor, labels: torch.tensor, batch_size: 32) -> float:
+    def evaluate(self, data_embeddings: torch.tensor, labels: torch.tensor, batch_size: int = 32) -> float:
         for i in range(0, len(data_embeddings), batch_size):
 
             batch_embeddings = data_embeddings[i:i+batch_size]
             batch_labels = labels[i:i+batch_size]
 
-            batch_embeddings = torch.mean(batch_embeddings, dim=1)
+            batch_embeddings = torch.mean(batch_embeddings, dim=1).to(device)
 
             with torch.no_grad():
                 outputs = self.probe(batch_embeddings)
@@ -194,7 +195,16 @@ class Probe():
         return accuracy
     
 
-probe = Probe()
+target_tag = "theme:emergency_referrals" # label based on whether there is an emergency referral in response
+
+train_labels = torch.tensor(
+    [1 if target_tag in x["example_tags"] else 0 for x in split["train"]],
+    dtype=torch.long
+)
+test_labels = torch.tensor(
+    [1 if target_tag in x["example_tags"] else 0 for x in split["test"]],
+    dtype=torch.long
+)
 
 layer_wise_accuracies = []
 best_probe, best_layer, best_accuracy = None, -1, 0
@@ -202,12 +212,12 @@ batch_size = 32 #?
 
 for layer_num in range(NUM_LAYERS):
     logging.info(f'evaluating representations of layer {layer_num}:\n')
+
     train_embeddings = extract_activations(model, tokenizer, layer_num=layer_num, data=split['train']['text_for_langdetect'], batch_size=batch_size)
-    train_labels = torch.tensor(split['train']['label'], dtype=torch.long)
     test_embeddings = extract_activations(model, tokenizer, layer_num=layer_num, data=split['test']['text_for_langdetect'], batch_size=batch_size)
-    test_labels = torch.tensor(dev_dataset['test']['label'],  dtype=torch.long)
+
     probe = Probe()
-    probe.train(data_embeddings=train_embeddings, labels = train_labels, num_epochs=5, learning_rate=0.001, batch_size=8)
+    probe.train(data_embeddings=train_embeddings, labels = train_labels, num_epoch=5, learning_rate=0.001, batch_size=8)
     accuracy = probe.evaluate(data_embeddings=test_embeddings, labels=test_labels)
     layer_wise_accuracies.append(accuracy)
 
