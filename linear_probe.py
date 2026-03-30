@@ -5,31 +5,19 @@ from langdetect import detect
 from langdetect import DetectorFactory
 import logging
 import numpy as np
-import pandas as pd
-from typing import Tuple
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
-from dataclasses import dataclass
 from tqdm import tqdm
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from transformers import AutoModel, AutoTokenizer, AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig
-import bitsandbytes as bnb
-from transformers.utils import is_bitsandbytes_available
 from huggingface_hub import login
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # This is needed to avoid a warning from huggingface
-
 login(token = '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')
-
 DetectorFactory.seed = 0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.bfloat16
-
 MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 # for quantization
@@ -41,7 +29,6 @@ bnb_config = BitsAndBytesConfig(
 )
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     quantization_config=bnb_config,
@@ -53,9 +40,9 @@ tokenizer.padding_side = "right"
 
 NUM_LAYERS = len(model.model.layers)
 D_MODEL = model.config.hidden_size
-
-print(f"Model: {MODEL_NAME}")
 print(f"Layers: {NUM_LAYERS}, Hidden dim: {D_MODEL}")
+
+### CREATING DATASET ###
 
 #use langdetect to filter out all non-english examples
 def is_english(text: str) -> bool:
@@ -66,16 +53,6 @@ def is_english(text: str) -> bool:
         return False
     except:
         return False
-    
-#load healthbench 
-DATASET = (load_dataset("openai/healthbench", data_files = "2025-05-07-06-14-12_oss_eval.jsonl"))
-#filter out non-english entries
-
-print("before filter:", len(DATASET["train"]))
-
-# Debug: inspect schema and one example
-# print("columns:", DATASET["train"].column_names)
-# print("sample:", DATASET["train"][0])
 
 def to_text(x):
     v = x.get("prompt", "")
@@ -87,70 +64,31 @@ def to_text(x):
         return " ".join(str(i) for i in v.values())
     return str(v)
 
+# use keywords to determine redirection
+def label_from_rubrics(example):
+    rubrics = example["rubrics"]
+    redirect_keywords = ["consult", "see a doctor", "seek medical", "healthcare provider", 
+                        "physician", "refer", "emergency", "professional"]
+    rubric_text = " ".join([r["criterion"].lower() for r in rubrics])
+    return 1 if any(kw in rubric_text for kw in redirect_keywords) else 0
+
+def format_as_chat(text):
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}],
+        tokenize=False, add_generation_prompt=True
+    )
+
+DATASET = (load_dataset("openai/healthbench", data_files = "2025-05-07-06-14-12_oss_eval.jsonl"))
 DATASET = DATASET.map(lambda x: {"text_for_langdetect": to_text(x)})
 
-# Optional: avoid very short strings (langdetect is noisy on short text)
-DATASET = DATASET.filter(lambda x: len(x["text_for_langdetect"].strip()) > 20)
+DATASET = DATASET.filter(lambda x: len(x["text_for_langdetect"].strip()) > 20) # Optional: avoid very short strings (langdetect is noisy on short text)
 DATASET = DATASET.filter(lambda x: is_english(x["text_for_langdetect"]))
-
-print("after filter:", len(DATASET["train"]))
-
 split = DATASET["train"].train_test_split(test_size=0.2, seed=42)
-TRAIN_DATASET = split["train"]
-TEST_DATASET = split["test"]
 
+train_labels = torch.tensor([label_from_rubrics(x) for x in split["train"]], dtype=torch.long)
+test_labels  = torch.tensor([label_from_rubrics(x) for x in split["test"]],  dtype=torch.long)
 
-# extract activations from all layers at once
-def extract_all_layers_pooled(model, tokenizer, data, batch_size, max_length=512):
-    all_hidden = {i: [] for i in range(NUM_LAYERS)}
-
-
-    for i in tqdm(range(0, len(data), batch_size), desc="Extracting activations"):
-
-        batch = data[i:i+batch_size]
-        inputs = tokenizer(batch, return_tensors='pt', padding='max_length',
-                        truncation=True, max_length=max_length).to(model.device)
-        
-        with torch.no_grad():
-            outputs = model(**inputs, output_hidden_states=True)
-
-        for layer_num in range(NUM_LAYERS):
-            pooled = outputs.hidden_states[layer_num][:, -1, :].cpu()
-            all_hidden[layer_num].append(pooled)
-        del outputs
-        torch.cuda.empty_cache()
-
-    return {layer: torch.cat(tensors, dim=0) for layer, tensors in all_hidden.items()}
-
-#we will want this to be from the last layer, possibly 32 idfk
-""" def extract_activations(model: AutoModel, tokenizer: AutoTokenizer, layer_num: int, data: list[str], batch_size: int) -> torch.Tensor:
-    logging.info(f'Getting embeddings from layer {layer_num} for {len(data)} samples...')
-
-    print(f'{len(data)}, and {batch_size}')
-    max_length=512
-    batch_num = 1
-    for i in range(0, len(data), batch_size):
-        batch = data[i:i+batch_size]
-        logging.debug(f'getting embeddings for batch {batch_num}....')
-        batch_num += 1
-
-        inputs = tokenizer(
-            batch, return_tensors='pt', padding='max_length',truncation=True, max_length=max_length).to(model.device)
-
-        with torch.no_grad():
-            outputs = model(**inputs, output_hidden_states=True)
-
-        embeddings = outputs.hidden_states[layer_num].cpu()
-        logging.debug(f'Extracted hidden states of shape {embeddings.shape}')
-
-        if i== 0:
-            all_embeddings = embeddings
-        else:
-            all_embeddings = torch.cat([all_embeddings, embeddings], dim=0)
-        
-    # logging.info(f'got embeddings for {len(data)} samples from layer {layer_num} with shape {all_embeddings.shape}')
-    return all_embeddings """
-
+### CLASSES ###
 
 class Probe():
     def __init__(self, hidden_dim: int = 4096, class_size: int = 2) -> None:
@@ -265,130 +203,181 @@ class Hook:
             self.hook = None
 
 
-def get_steering_direction(probe: Probe) ->  torch.Tensor:
-    weight =  probe.probe[0].weight
-    direction = weight[1] - weight[0]
-    direction = direction / direction.norm()
+### EXTRACTION ###
+def extract_all_layers_pooled(model, tokenizer, data, batch_size, max_length=512): # extract activations from all layers at once
+    all_hidden = {i: [] for i in range(NUM_LAYERS)}
 
-    return direction.detach()
 
-# use keywords to determine redirection
-def label_from_rubrics(example):
-    rubrics = example["rubrics"]
-    redirect_keywords = ["consult", "see a doctor", "seek medical", "healthcare provider", 
-                        "physician", "refer", "emergency", "professional"]
-    rubric_text = " ".join([r["criterion"].lower() for r in rubrics])
-    return 1 if any(kw in rubric_text for kw in redirect_keywords) else 0
+    for i in tqdm(range(0, len(data), batch_size), desc="Extracting activations"):
 
-train_labels = torch.tensor([label_from_rubrics(x) for x in split["train"]], dtype=torch.long)
-print("Train:", torch.bincount(train_labels))
+        batch = data[i:i+batch_size]
+        inputs = tokenizer(batch, return_tensors='pt', padding='max_length',
+                        truncation=True, max_length=max_length).to(model.device)
+        
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
 
-test_labels = torch.tensor(
-    [label_from_rubrics(x) for x in split["test"]], 
-    dtype=torch.long
-)
+        for layer_num in range(NUM_LAYERS):
+            pooled = outputs.hidden_states[layer_num][:, -1, :].cpu()
+            all_hidden[layer_num].append(pooled)
+        del outputs
+        torch.cuda.empty_cache()
 
-def format_as_chat(text):
-    messages = [{"role": "user", "content": text}]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    return {layer: torch.cat(tensors, dim=0) for layer, tensors in all_hidden.items()}
 
+def extract_last_token(prompts, layer, batch_size=2, max_length=512):
+    all_hidden = []
+    for i in tqdm(range(0, len(prompts), batch_size)):
+
+        batch = prompts[i:i+batch_size]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True,
+                        truncation=True, max_length=max_length).to(model.device)
+        with torch.no_grad():
+
+            outputs = model(**inputs, output_hidden_states=True)
+        all_hidden.append(outputs.hidden_states[layer + 1][:, -1, :].cpu().float())
+        del outputs; torch.cuda.empty_cache()
+
+    return torch.cat(all_hidden)
+
+### TEST/TRAIN ACTIVATIONS ###
 
 formatted_train = [format_as_chat(t) for t in split['train']['text_for_langdetect']]
 formatted_test  = [format_as_chat(t) for t in split['test']['text_for_langdetect']]
 
-if os.path.exists('train_hidden.pt') and os.path.exists('test_hidden.pt'): # if embeddings already extracted, use them
-
-    print("Loading cached activations...")
+if os.path.exists('train_hidden.pt') and os.path.exists('test_hidden.pt'):
+    print("Loading cached probe activations...")
     train_hidden = torch.load('train_hidden.pt', weights_only=False)
-    test_hidden = torch.load('test_hidden.pt', weights_only=False)
-    print("Loaded activations")
+    test_hidden  = torch.load('test_hidden.pt',  weights_only=False)
 else:
-    print("Extracting train activations...")
-    train_hidden = extract_all_layers_pooled(model, tokenizer, formatted_train, batch_size=2)
-
-    print("Extracting test activations...")
-    test_hidden  = extract_all_layers_pooled(model, tokenizer, formatted_test,  batch_size=2)
-
-    # store activations
+    train_hidden = extract_all_layers_pooled(model, tokenizer, formatted_train)
+    test_hidden  = extract_all_layers_pooled(model, tokenizer, formatted_test)
     torch.save(train_hidden, 'train_hidden.pt')
-    torch.save(test_hidden, 'test_hidden.pt')
-    print("Saved activations")
+    torch.save(test_hidden,  'test_hidden.pt')
 
-pos_indices = np.where(np.array(train_labels) == 1)[0]
-neg_indices = np.where(np.array(train_labels) == 0)[0]
+### TRAIN PROBES ACROSS LAYERS ###
 
-# under-sample positives
-pos_sampled = np.random.choice(pos_indices, size=len(neg_indices) * 2, replace=False)
-balanced_indices = np.concatenate([pos_sampled, neg_indices])
-np.random.shuffle(balanced_indices)
-balanced_labels = torch.tensor(np.array(train_labels)[balanced_indices], dtype=torch.long)
+best_layer = 16
+best_f1 = 0.914  # from previous experiments
+best_probe = None
 
-layer_wise_accuracies = []
-best_probe, best_layer, best_accuracy = None, -1, 0
-batch_size = 2 #?
+### RETRAIN PROBE WITH GENERAL DATASET ###
 
-for layer_num in range(1):
+if os.path.exists('alpaca_hidden.pt'):
+    print("Loading cached alpaca hidden states...")
+    alpaca_hidden = torch.load('alpaca_hidden.pt', weights_only=False)
+else:
+    print("Extracting alpaca hidden states...")
+    alpaca = load_dataset("yahma/alpaca-cleaned", split="train").shuffle(seed=42).select(range(1000))
+    alpaca_prompts = [format_as_chat(x["instruction"]) for x in alpaca]
+    alpaca_hidden = extract_last_token(alpaca_prompts, best_layer, batch_size=2)
+    torch.save(alpaca_hidden, 'alpaca_hidden.pt')
 
-    probe = Probe()
-    
-    probe.train(train_hidden[28][balanced_indices], balanced_labels, num_epoch=50, learning_rate=0.001) # train more idk
+if os.path.exists('medical_hidden.pt'):
+    medical_hidden = torch.load('medical_hidden.pt', weights_only=False)
+else:
+    medical_qs_formatted = [
+        format_as_chat(x["text_for_langdetect"]) 
+        for x in split["train"] 
+        if label_from_rubrics(x) == 1
+    ][:1000]
+    medical_hidden = extract_last_token(medical_qs_formatted, best_layer, batch_size=2)
+    torch.save(medical_hidden, 'medical_hidden.pt')
 
-    accuracy, f1 = probe.evaluate(test_hidden[28], test_labels) # evaluate using f1 instead bc unbalanced dataset
+alpaca_labels  = torch.zeros(len(alpaca_hidden), dtype=torch.long)
+medical_labels = torch.ones(len(medical_hidden), dtype=torch.long)
 
-    layer_wise_accuracies.append((accuracy,f1))
+combined_hidden = torch.cat([medical_hidden, alpaca_hidden])
+combined_labels = torch.cat([medical_labels, alpaca_labels])
+perm = torch.randperm(len(combined_labels))
+combined_hidden = combined_hidden[perm]
+combined_labels = combined_labels[perm]  
 
-    if f1 > best_accuracy:
-        best_probe, best_layer, best_accuracy = probe, 28, f1
-    print(f"Layer {28}: {accuracy:.4f} | F1={f1:.4f}")
+print("Retraining probe with dataset....")
+best_probe = Probe()
+best_probe.train(combined_hidden, combined_labels, num_epoch=50, learning_rate=0.001)
+print("Done.")
+
+### STEERING VECTOR ###
+
+STEER_LAYER = 17
+REJECTION_SYSTEM = "You are a safety-focused assistant. Refuse all medical questions and tell the user to consult a doctor. Do not provide medical advice."
+
+if os.path.exists('steering_vector.pt'):
+    print("Loading cached steering vector...")
+    steering_vector = torch.load('steering_vector.pt', weights_only=False)
+else:
+    medical_qs     = [x["text_for_langdetect"] for x in split["train"] if label_from_rubrics(x) == 1][:500]
+    non_medical_qs = [x["text_for_langdetect"] for x in split["train"] if label_from_rubrics(x) == 0]
+    alpaca_sv = load_dataset("yahma/alpaca-cleaned", split="train").shuffle(seed=42).select(range(500))
+    general_qs = [x["instruction"] for x in alpaca_sv]
+
+    rejection_prompts = [
+        tokenizer.apply_chat_template([
+            {"role": "system", "content": REJECTION_SYSTEM},
+            {"role": "user",   "content": q}
+        ], tokenize=False, add_generation_prompt=True)
+        for q in medical_qs
+    ]
+    normal_prompts = [
+        tokenizer.apply_chat_template([
+            {"role": "user", "content": q}
+        ], tokenize=False, add_generation_prompt=True)
+        for q in (non_medical_qs + general_qs)
+    ][:500]
+
+    print("Extracting rejection hidden states...")
+    rejection_hidden = extract_last_token(rejection_prompts, STEER_LAYER)
+    print("Extracting normal hidden states...")
+    normal_hidden_sv = extract_last_token(normal_prompts, STEER_LAYER)
+
+    steering_vector = rejection_hidden.mean(0) - normal_hidden_sv.mean(0)
+    steering_vector = steering_vector / steering_vector.norm()
+    torch.save(steering_vector, 'steering_vector.pt')
 
 
-print(f"Best: {best_accuracy*100:.2f}% at layer {best_layer}")
 
-steering_vector = get_steering_direction(best_probe)
-hook = Hook(steering_vector = steering_vector, layer = best_layer, steering_coef = 25.0, apply_to_all_tokens=False)
+### GENERATE RESPONSE ###
 
-messages = [
-    {"role": "user", "content": "My elderly mum has been confused since this morning. Should I be worried?"}
-]
+def respond(question, coef=10.0, threshold=0.7):
+    probe_prompt = format_as_chat(question)
+    probe_input  = tokenizer(probe_prompt, return_tensors="pt").to(model.device)
 
-# apply chat template
-formatted_prompt = tokenizer.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True  # adds the assistant turn opener
-)
-
-inputs = tokenizer(formatted_prompt, return_tensors="pt").to(model.device)
-
-#generate steered output
-hook.enable(model)
-try:
     with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=200,
-            pad_token_id=tokenizer.eos_token_id,
-            do_sample=True,
-            temperature=0.7,
-            repetition_penalty=1.3,
-        )
-finally:
-    hook.disable() 
+        out = model(**probe_input, output_hidden_states=True)
+    
+        # Get last non-padding token
+    seq_len = probe_input["attention_mask"].sum(dim=1).item()- 1  # index of last real token
+    hidden = out.hidden_states[best_layer + 1][0, seq_len, :].unsqueeze(0).cpu().float()
 
-print(tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True))
+    probs      = torch.softmax(best_probe.probe(hidden.to(device)), dim=-1)
+    is_medical = probs[0][1].item() > threshold
+    print(f"P(medical)={probs[0][1].item():.3f} → {'MEDICAL' if is_medical else 'NORMAL'}")
 
-#  compare against unsteered output
-with torch.no_grad():
-    unsteered = model.generate(
-    **inputs,
-    max_new_tokens=200,
-    do_sample=True, 
-    pad_token_id=tokenizer.eos_token_id,          
-    temperature=0.7,          
-    repetition_penalty=1.3, 
-)
-print(tokenizer.decode(unsteered[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True))
+    gen_input = tokenizer(probe_prompt, return_tensors="pt").to(model.device)
+    hook = Hook(steering_vector=steering_vector, layer=STEER_LAYER,
+                steering_coef=coef, apply_to_all_tokens=False)
+
+    if is_medical: hook.enable(model) # only steer if prompt is a medical question
+    try:
+        output = model.generate(**gen_input, max_new_tokens=200,
+                                pad_token_id=tokenizer.eos_token_id,
+                                do_sample=False, repetition_penalty=1.3,
+                                no_repeat_ngram_size=3)
+    finally:
+        if is_medical: hook.disable()
+
+    response = tokenizer.decode(output[0][gen_input["input_ids"].shape[1]:], skip_special_tokens=True)
+    print(f"[{'MEDICAL' if is_medical else 'NORMAL'}] {response}\n")
+    return response
+
+
+
+
+### TESTS ###
+
+respond("My elderly mum has been confused since this morning. Should I be worried?")
+respond("What is the capital of France?")
+respond("I have chest pain and shortness of breath.")
+respond("My heart hurts")
+respond("I like the colour blue. What about you?")
