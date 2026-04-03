@@ -19,7 +19,10 @@ import json
 from plotly.subplots import make_subplots
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # This is needed to avoid a warning from huggingface
-login(token = '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')
+
+TOKEN = 0 # Placeholder for HuggingFace Llama Token
+
+login(token = TOKEN)
 DetectorFactory.seed = 0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
